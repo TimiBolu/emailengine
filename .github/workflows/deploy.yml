@@ -2,7 +2,7 @@ on:
     push:
         branches:
             - master
-            - oauth-prefer-account-email
+            - webhook-exec-errors
 
 name: Deploy test instance
 

@@ -25,6 +25,7 @@ const packageData = require('./package.json');
 const config = require('wild-config');
 const logger = require('./lib/logger');
 const { readEnvValue, hasEnvValue } = require('./lib/tools');
+const { webhooks: Webhooks } = require('./lib/webhooks');
 const nodeFetch = require('node-fetch');
 const fetchCmd = global.fetch || nodeFetch;
 
@@ -51,7 +52,7 @@ if (readEnvValue('BUGSNAG_API_KEY')) {
 }
 
 const pathlib = require('path');
-const { redis, queueConf, notifyQueue } = require('./lib/db');
+const { redis, queueConf } = require('./lib/db');
 const promClient = require('prom-client');
 const fs = require('fs').promises;
 const crypto = require('crypto');
@@ -61,7 +62,7 @@ const { settingsSchema } = require('./lib/schemas');
 const settings = require('./lib/settings');
 const tokens = require('./lib/tokens');
 
-const { QueueScheduler } = require('bullmq');
+const { QueueEvents } = require('bullmq');
 
 const getSecret = require('./lib/get-secret');
 
@@ -193,9 +194,7 @@ const licenseInfo = {
     type: packageData.license
 };
 
-let notifyScheduler;
-let submitScheduler;
-let documentsScheduler;
+const queueEvents = {};
 
 let preparedSettings = false;
 const preparedSettingsString = readEnvValue('EENGINE_SETTINGS') || config.settings;
@@ -277,6 +276,16 @@ const metrics = {
         name: 'imap_responses',
         help: 'IMAP responses',
         labelNames: ['response', 'code']
+    }),
+
+    imapBytesSent: new promClient.Counter({
+        name: 'imap_bytes_sent',
+        help: 'IMAP bytes sent'
+    }),
+
+    imapBytesReceived: new promClient.Counter({
+        name: 'imap_bytes_received',
+        help: 'IMAP bytes received'
     }),
 
     webhooks: new promClient.Counter({
@@ -523,7 +532,10 @@ let updateServerState = async (type, state, payload) => {
 };
 
 async function sendWebhook(account, event, data) {
+    let serviceUrl = (await settings.get('serviceUrl')) || true;
+
     let payload = {
+        serviceUrl,
         account,
         date: new Date().toISOString()
     };
@@ -536,16 +548,7 @@ async function sendWebhook(account, event, data) {
         payload.data = data;
     }
 
-    let queueKeep = (await settings.get('queueKeep')) || true;
-    await notifyQueue.add(event, payload, {
-        removeOnComplete: queueKeep,
-        removeOnFail: queueKeep,
-        attempts: 10,
-        backoff: {
-            type: 'exponential',
-            delay: 5000
-        }
-    });
+    await Webhooks.pushToQueue(event, await Webhooks.formatPayload(event, payload));
 }
 
 let spawnWorker = async type => {
@@ -839,13 +842,14 @@ async function call(worker, message, transferList) {
     return new Promise((resolve, reject) => {
         let mid = `${Date.now()}:${++mids}`;
 
+        let ttl = Math.max(message.timeout || 0, EENGINE_TIMEOUT || 0);
         let timer = setTimeout(() => {
             let err = new Error('Timeout waiting for command response [T1]');
             err.statusCode = 504;
             err.code = 'Timeout';
-            err.payload = message;
+            err.ttl = ttl;
             reject(err);
-        }, message.timeout || EENGINE_TIMEOUT);
+        }, ttl);
 
         callQueue.set(mid, { resolve, reject, timer });
 
@@ -1372,16 +1376,16 @@ async function collectMetrics() {
 
 const closeQueues = cb => {
     let proms = [];
-    if (notifyScheduler) {
-        proms.push(notifyScheduler.close());
+    if (queueEvents.notify) {
+        proms.push(queueEvents.notify.close());
     }
 
-    if (submitScheduler) {
-        proms.push(submitScheduler.close());
+    if (queueEvents.submit) {
+        proms.push(queueEvents.submit.close());
     }
 
-    if (documentsScheduler) {
-        proms.push(documentsScheduler.close());
+    if (queueEvents.documents) {
+        proms.push(queueEvents.documents.close());
     }
 
     if (!proms.length) {
@@ -1655,9 +1659,9 @@ startApplication()
         upgradeCheckTimer = setTimeout(checkUpgrade, UPGRADE_CHECK_TIMEOUT);
         upgradeCheckTimer.unref();
 
-        notifyScheduler = new QueueScheduler('notify', Object.assign({}, queueConf));
-        submitScheduler = new QueueScheduler('submit', Object.assign({}, queueConf));
-        documentsScheduler = new QueueScheduler('documents', Object.assign({}, queueConf));
+        queueEvents.notify = new QueueEvents('notify', Object.assign({}, queueConf));
+        queueEvents.submit = new QueueEvents('submit', Object.assign({}, queueConf));
+        queueEvents.documents = new QueueEvents('documents', Object.assign({}, queueConf));
     })
     .catch(err => {
         logger.error({ msg: 'Failed to start application', err });
